@@ -16,7 +16,7 @@ import re
 
 import torch
 
-from model import DEFAULT_MODEL, generate, load_model
+from model import DEFAULT_MODEL, default_device, generate, load_model
 
 DECOMPOSE_PROMPT = """Break the following answer into a JSON array of short, atomic factual claims. Each claim should be one sentence or less. Output only valid JSON.
 
@@ -170,7 +170,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device or default_device()
     model, tokenizer = load_model(args.model, device)
 
     results = highlight(args.question, args.answer, baseline_mod.score, model, tokenizer, device)

@@ -21,7 +21,7 @@ from sklearn.metrics import roc_auc_score
 import baseline as baseline_mod
 import semantic_entropy as se_mod
 from data import grade_truthfulqa, load_halueval_split, load_truthfulqa
-from model import DEFAULT_MODEL, load_model
+from model import DEFAULT_MODEL, default_device, load_model
 
 
 def auroc(scores, labels):
@@ -104,7 +104,7 @@ def main():
     parser.add_argument("--train_frac", type=float, default=0.8)
     args = parser.parse_args()
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device or default_device()
     print(f"Loading model {args.model} on {device}...")
     model, tokenizer = load_model(args.model, device)
 

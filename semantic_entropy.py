@@ -21,7 +21,7 @@ import math
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from model import DEFAULT_MODEL, load_model
+from model import DEFAULT_MODEL, default_device, load_model
 
 NLI_MODEL_NAME = "microsoft/deberta-large-mnli"
 ENTAIL_LABEL = 2  # DeBERTa MNLI label order: 0=contradiction, 1=neutral, 2=entailment
@@ -133,7 +133,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device or default_device()
     print(f"Loading LLM ({args.model})...")
     model, tokenizer = load_model(args.model, device)
     print(f"Loading NLI model ({NLI_MODEL_NAME})...")

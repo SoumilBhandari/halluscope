@@ -14,11 +14,25 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 DEFAULT_MODEL = os.environ.get("HALLUSCOPE_MODEL", "meta-llama/Llama-3.2-3B-Instruct")
 
 
+def default_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def load_model(model_name=DEFAULT_MODEL, device=None):
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = default_device()
 
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    # bfloat16 on CUDA; float16 on MPS (bfloat16 unstable on M1); float32 on CPU
+    if device == "cuda":
+        dtype = torch.bfloat16
+    elif device == "mps":
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:

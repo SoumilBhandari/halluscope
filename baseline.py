@@ -15,7 +15,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from model import DEFAULT_MODEL, forward_hidden, load_model
+from model import DEFAULT_MODEL, default_device, forward_hidden, load_model
 
 
 @torch.no_grad()
@@ -88,7 +88,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device or default_device()
     model, tokenizer = load_model(args.model, device)
 
     # Sanity check: true answer should score lower than false answer

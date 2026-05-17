@@ -21,13 +21,13 @@ import torch
 import baseline as baseline_mod
 import highlight as hl_mod
 import semantic_entropy as se_mod
-from model import DEFAULT_MODEL, generate, load_model
+from model import DEFAULT_MODEL, default_device, generate, load_model
 
 PROBE_PATH = os.environ.get("HALLUSCOPE_PROBE", "probe.pkl")
 
 
 def _load_all():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = default_device()
     model, tokenizer = load_model(DEFAULT_MODEL, device)
 
     nli_model, nli_tokenizer = None, None

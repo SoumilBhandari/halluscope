@@ -27,7 +27,7 @@ import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from model import DEFAULT_MODEL, load_model
+from model import DEFAULT_MODEL, default_device, load_model
 
 
 def extract_hidden(question, answer, model, tokenizer, device, layer=16):
@@ -137,7 +137,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_n", type=int, default=None)
     args = parser.parse_args()
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device or default_device()
 
     from data import load_halueval_split
 

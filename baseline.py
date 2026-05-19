@@ -15,7 +15,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from model import DEFAULT_MODEL, default_device, forward_hidden, load_model
+from model import DEFAULT_MODEL, default_device, load_model
 
 
 @torch.no_grad()
@@ -45,27 +45,6 @@ def logprobs_for_answer(question, answer, model, tokenizer, device):
     return token_logp
 
 
-@torch.no_grad()
-def predictive_entropy(question, answer, model, tokenizer, device):
-    """
-    Mean per-token predictive entropy: -sum_v p(v|context) log p(v|context).
-    Averaged over answer tokens. Higher = more uncertain.
-    """
-    q_ids = tokenizer(question, return_tensors="pt")["input_ids"]
-    qa_ids = tokenizer(question + " " + answer, return_tensors="pt")["input_ids"].to(device)
-
-    outputs = model(qa_ids)
-    logits = outputs.logits[0]  # (T, V)
-
-    probs = F.softmax(logits, dim=-1)
-    log_probs = F.log_softmax(logits, dim=-1)
-    entropy = -(probs * log_probs).sum(dim=-1)  # (T,)
-
-    q_len = q_ids.shape[1]
-    ans_entropy = entropy[q_len - 1 :]  # align with shifted prediction
-    return ans_entropy.mean().item()
-
-
 def score(question, answer, model, tokenizer, device):
     """
     Hallucination score via negative mean log-prob (higher = more hallucinated).
@@ -75,11 +54,6 @@ def score(question, answer, model, tokenizer, device):
     if lp.numel() == 0:
         return 0.0
     return (-lp.mean()).item()
-
-
-def score_entropy(question, answer, model, tokenizer, device):
-    """Alternative scorer using predictive entropy instead of mean log-prob."""
-    return predictive_entropy(question, answer, model, tokenizer, device)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-DEFAULT_MODEL = os.environ.get("HALLUSCOPE_MODEL", "meta-llama/Llama-3.2-3B-Instruct")
+DEFAULT_MODEL = os.environ.get("HALLUSCOPE_MODEL", "Qwen/Qwen2.5-3B-Instruct")
 
 
 def default_device():
@@ -58,7 +58,8 @@ def generate(
     top_k=50,
     num_return_sequences=1,
     return_logprobs=True,
-    return_hidden_states=True,
+    return_hidden_states=False,
+    chat=True,
 ):
     """
     Generate from prompt. Returns a dict (or list of dicts for num_return_sequences > 1):
@@ -66,8 +67,20 @@ def generate(
       logprobs      : Tensor[T_new] — per-token log-prob of the chosen token
       hidden        : Tensor[L+1, T_prompt+T_new, D] — all layer hidden states
                       use hidden[:, -1, :] for last-token representation
+
+    chat=True wraps the prompt in the model's chat template. Instruction-tuned
+    models need this — fed a bare prompt they continue it as a document instead
+    of answering. Falls back to raw tokenization if the tokenizer has no template.
     """
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    if chat and getattr(tokenizer, "chat_template", None):
+        inputs = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        ).to(device)
+    else:
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[1]
 
     # temperature=0 isn't valid; use greedy via do_sample=False
@@ -100,30 +113,14 @@ def generate(
             logprobs = log_probs_all[range(len(token_ids)), token_ids]
 
         hidden = None
-        if return_hidden_states and outputs.hidden_states:
-            # outputs.hidden_states: tuple per decoding step, each is tuple of L+1 tensors (B, T, D)
-            # We want the hidden states at the final token position across all layers.
-            # Collect last-token hidden state from each step's last layer isn't quite right;
-            # instead stack the full sequence hidden states from the last decoding step.
-            #
-            # For the full sequence (prompt + generated), run a forward pass to get clean hiddens.
+        if return_hidden_states:
+            # Re-run a clean forward pass over the full sequence; generate()'s own
+            # hidden_states are emitted per decoding step and awkward to stitch
+            # back into a single (L+1, T, D) tensor.
             full_ids = outputs.sequences[seq_idx].unsqueeze(0)
             fwd = model(full_ids, output_hidden_states=True)
-            # fwd.hidden_states: tuple of L+1 tensors each (1, T_full, D)
             hidden = torch.stack([h[0] for h in fwd.hidden_states], dim=0)  # (L+1, T_full, D)
 
         results.append({"text": text, "logprobs": logprobs, "hidden": hidden})
 
     return results[0] if num_return_sequences == 1 else results
-
-
-@torch.no_grad()
-def forward_hidden(prompt, model, tokenizer, device):
-    """
-    Single forward pass — returns hidden states only (no generation).
-    Cheaper than generate() when you only need hidden states for a fixed text.
-    Returns: Tensor[L+1, T, D]
-    """
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    outputs = model(**inputs, output_hidden_states=True)
-    return torch.stack([h[0] for h in outputs.hidden_states], dim=0)  # (L+1, T, D)

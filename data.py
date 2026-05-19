@@ -2,13 +2,14 @@
 Dataset loaders for HaluEval and TruthfulQA.
 
 HaluEval  — contrastive QA pairs (question, right_answer, hallucinated_answer).
-            Each row yields two labeled records: label=0 (correct), label=1 (hallucinated).
-            Used to train the probe and as the primary eval dataset.
+            Each row yields two labeled records: label=0 (correct), label=1
+            (hallucinated). Split question-disjoint into train/val/test;
+            train builds the probe, val tunes the layer, test is held out.
 
 TruthfulQA — 817 adversarial questions with correct + incorrect answer lists.
              The model generates an answer; grade_truthfulqa() labels it 0/1
-             by ROUGE-1 F1 comparison against the ground-truth answer lists.
-             Used only for eval (no train split) — the OOD test for the probe.
+             by ROUGE-1 F1 comparison against the answer lists. Eval-only —
+             the out-of-distribution test for the probe.
 """
 
 import random
@@ -17,61 +18,45 @@ from datasets import load_dataset
 from rouge_score import rouge_scorer as rouge_lib
 
 
-def load_halueval(split="train", max_n=None, seed=42):
+def load_halueval_splits(train_frac=0.7, val_frac=0.1, seed=42):
     """
-    Returns list of {"question": str, "answer": str, "label": int} dicts.
-    label=0 correct, label=1 hallucinated.
-    Each HaluEval row produces two records.
+    Returns (train, val, test) record lists from HaluEval QA.
+
+    Each record is {"question": str, "answer": str, "label": int}
+    (label 0 = correct, 1 = hallucinated).
+
+    The split is computed on the *full* shuffled dataset and is determined
+    entirely by `seed`. It never depends on how many records a caller later
+    consumes, so train/val/test stay disjoint no matter what — this fixes the
+    silent leakage that arose when training and evaluation passed different
+    caps and recomputed the split independently.
+
+    The split is question-disjoint: each HaluEval row (one question with a
+    correct and a hallucinated answer) goes wholly into one split before being
+    expanded into its two labeled records.
     """
     ds = load_dataset("pminervini/HaluEval", "qa")
-
-    # Map split names: HaluEval uses "data" for train
-    split_map = {"train": "data", "validation": "data", "test": "data"}
-    actual_split = split_map.get(split, split)
-
-    if actual_split not in ds:
-        actual_split = list(ds.keys())[0]
-
-    rows = ds[actual_split]
-    records = []
-    for row in rows:
-        q = row["question"]
-        records.append({"question": q, "answer": row["right_answer"], "label": 0})
-        records.append({"question": q, "answer": row["hallucinated_answer"], "label": 1})
-
-    rng = random.Random(seed)
-    rng.shuffle(records)
-
-    if max_n is not None:
-        records = records[:max_n]
-
-    return records
-
-
-def load_halueval_split(train_frac=0.8, max_n=None, seed=42):
-    """Returns (train_records, test_records) from HaluEval with question-disjoint split."""
-    ds = load_dataset("pminervini/HaluEval", "qa")
-    actual_split = list(ds.keys())[0]
-    rows = list(ds[actual_split])
+    rows = list(ds[list(ds.keys())[0]])
 
     rng = random.Random(seed)
     rng.shuffle(rows)
 
-    if max_n is not None:
-        rows = rows[: max_n // 2]  # //2 because each row → 2 records
+    n = len(rows)
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+    train_rows = rows[:n_train]
+    val_rows = rows[n_train : n_train + n_val]
+    test_rows = rows[n_train + n_val :]
 
-    n_train = int(len(rows) * train_frac)
-    train_rows, test_rows = rows[:n_train], rows[n_train:]
-
-    def rows_to_records(r):
+    def to_records(rs):
         out = []
-        for row in r:
+        for row in rs:
             q = row["question"]
             out.append({"question": q, "answer": row["right_answer"], "label": 0})
             out.append({"question": q, "answer": row["hallucinated_answer"], "label": 1})
         return out
 
-    return rows_to_records(train_rows), rows_to_records(test_rows)
+    return to_records(train_rows), to_records(val_rows), to_records(test_rows)
 
 
 def load_truthfulqa():
@@ -118,18 +103,17 @@ def grade_truthfulqa(model_answer, correct_answers, incorrect_answers):
 
 if __name__ == "__main__":
     print("Loading HaluEval...")
-    train, test = load_halueval_split(max_n=100)
-    print(f"  train: {len(train)} records, test: {len(test)} records")
+    train, val, test = load_halueval_splits()
+    print(f"  train: {len(train)}  val: {len(val)}  test: {len(test)} records")
     print(f"  sample: {train[0]}")
 
     print("\nLoading TruthfulQA...")
     tqa = load_truthfulqa()
     print(f"  {len(tqa)} questions")
-    print(f"  sample question: {tqa[0]['question']}")
+    q0 = tqa[0]
+    print(f"  sample question: {q0['question']}")
 
-    label = grade_truthfulqa(
-        "Paris is the capital of France.",
-        tqa[0]["correct_answers"],
-        tqa[0]["incorrect_answers"],
-    )
-    print(f"  grade check (Paris/France): label={label}")
+    # Sanity-check the ROUGE oracle against its own ground-truth answers.
+    good = grade_truthfulqa(q0["correct_answers"][0], q0["correct_answers"], q0["incorrect_answers"])
+    bad = grade_truthfulqa(q0["incorrect_answers"][0], q0["correct_answers"], q0["incorrect_answers"])
+    print(f"  grade oracle: correct -> {good} (expect 0), incorrect -> {bad} (expect 1)")

@@ -8,19 +8,22 @@ Why this works: mid-to-late transformer layers encode factual confidence in
 directions that a linear classifier can find. The model internally "knows"
 when it's confabulating — this probe reads that signal.
 
-Honest caveat: strong in-distribution (HaluEval train → HaluEval test,
-AUROC ~0.85–0.96) but drops to ~0.7–0.8 on TruthfulQA (OOD). The probe
-learns the *style* of HaluEval hallucinations, not universal lying.
+Honest caveat: strong in-distribution (HaluEval train -> HaluEval test) but
+drops on TruthfulQA (OOD). The probe learns the *style* of HaluEval
+hallucinations, not universal lying.
+
+The trained probe is saved as plain JSON (scaler statistics + logistic-
+regression weights), so loading a probe never executes pickled code.
 
 Usage:
-    python probe.py --train                     # train on HaluEval, save probe.pkl
-    python probe.py --sweep                     # find best layer first
+    python probe.py --train                     # train on HaluEval, save probe.json
+    python probe.py --sweep                     # find the best layer first
     python probe.py --score "q" "a"             # score a single q/a pair
 """
 
 import argparse
+import json
 import os
-import pickle
 
 import numpy as np
 import torch
@@ -33,72 +36,115 @@ from model import DEFAULT_MODEL, default_device, load_model
 def extract_hidden(question, answer, model, tokenizer, device, layer=16):
     """
     One forward pass; returns the hidden state at `layer`, last token position.
-    Shape: (D,) as float32 numpy array.
+    Shape: (D,) as a float32 numpy array.
     """
     prompt = question + " " + answer
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
     with torch.no_grad():
         outputs = model(**inputs, output_hidden_states=True)
-    # hidden_states: tuple of L+1 tensors each (1, T, D)
-    h = outputs.hidden_states[layer][0, -1, :]  # (D,)
-    return h.cpu().float().numpy()
+    return outputs.hidden_states[layer][0, -1, :].cpu().float().numpy()
 
 
-def build_features(records, model, tokenizer, device, layer=16, verbose=True):
-    """Extract hidden-state features for a list of records."""
-    X, y = [], []
-    for i, rec in enumerate(records):
-        if verbose and i % 100 == 0:
-            print(f"  extracting [{i}/{len(records)}]", flush=True)
-        h = extract_hidden(rec["question"], rec["answer"], model, tokenizer, device, layer)
-        X.append(h)
-        y.append(rec["label"])
-    return np.stack(X), np.array(y)
-
-
-def train_probe(records, model, tokenizer, device, layer=16):
+def build_features(records, model, tokenizer, device, layer=16, batch_size=16, verbose=True):
     """
-    Fit StandardScaler + LogisticRegression on hidden states extracted from records.
-    Returns: (scaler, clf)
+    Batched hidden-state extraction for a list of records.
+    Returns (X, y): X is (N, D) float32, y is (N,) int.
+
+    Batching makes feature extraction roughly an order of magnitude faster than
+    one forward pass per record. The last *non-pad* token is selected per
+    sequence, so the result is independent of the tokenizer's padding side.
+    """
+    feats, labels = [], []
+    for start in range(0, len(records), batch_size):
+        if verbose and start % (batch_size * 8) == 0:
+            print(f"  extracting [{start}/{len(records)}]", flush=True)
+        batch = records[start : start + batch_size]
+        prompts = [r["question"] + " " + r["answer"] for r in batch]
+        enc = tokenizer(
+            prompts, return_tensors="pt", padding=True, truncation=True, max_length=512
+        ).to(device)
+        with torch.no_grad():
+            out = model(**enc, output_hidden_states=True)
+        hs = out.hidden_states[layer]  # (B, T, D)
+        mask = enc["attention_mask"]
+        last_idx = mask.shape[1] - 1 - mask.flip(1).long().argmax(dim=1)  # last real token
+        rows = torch.arange(hs.shape[0], device=hs.device)
+        feats.append(hs[rows, last_idx].cpu().float())
+        labels.extend(r["label"] for r in batch)
+    return torch.cat(feats).numpy(), np.array(labels)
+
+
+def train_probe(records, model, tokenizer, device, layer=16, meta=None):
+    """
+    Fit StandardScaler + LogisticRegression on layer-`layer` features.
+    Returns a probe dict (plain data — JSON-serializable).
     """
     print(f"Extracting features (layer {layer}) for {len(records)} records...")
     X, y = build_features(records, model, tokenizer, device, layer)
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    Xs = scaler.fit_transform(X)
     print("Fitting logistic regression...")
     clf = LogisticRegression(max_iter=1000, C=1.0, solver="lbfgs")
-    clf.fit(X_scaled, y)
-    train_acc = clf.score(X_scaled, y)
-    print(f"Train accuracy: {train_acc:.4f}")
-    return scaler, clf
+    clf.fit(Xs, y)
+    print(f"Train accuracy: {clf.score(Xs, y):.4f}")
+
+    probe = {
+        "layer": int(layer),
+        "mean": scaler.mean_.tolist(),
+        "scale": scaler.scale_.tolist(),
+        "coef": clf.coef_[0].tolist(),
+        "intercept": float(clf.intercept_[0]),
+    }
+    if meta:
+        probe.update(meta)
+    return probe
 
 
-def save_probe(scaler, clf, layer, path="probe.pkl"):
-    with open(path, "wb") as f:
-        pickle.dump({"scaler": scaler, "clf": clf, "layer": layer}, f)
+def predict_proba(X, probe):
+    """P(hallucinated) for a feature matrix X of shape (N, D). Pure numpy."""
+    X = np.asarray(X, dtype=np.float64)
+    z = (X - probe["mean"]) / probe["scale"]
+    logits = z @ probe["coef"] + probe["intercept"]
+    return 1.0 / (1.0 + np.exp(-logits))
+
+
+def score(question, answer, model, tokenizer, device, probe):
+    """
+    Hallucination probability in [0, 1] (higher = more likely hallucinated).
+    Shared scorer interface (probe bound via functools.partial in eval.py/app.py).
+    """
+    h = extract_hidden(question, answer, model, tokenizer, device, probe["layer"])
+    return float(predict_proba(h[None, :], probe)[0])
+
+
+def save_probe(probe, path="probe.json"):
+    with open(path, "w") as f:
+        json.dump(probe, f)
     print(f"Probe saved to {path}")
 
 
-def load_probe(path="probe.pkl"):
-    with open(path, "rb") as f:
-        d = pickle.load(f)
-    return d["scaler"], d["clf"], d["layer"]
+def load_probe(path="probe.json"):
+    """Load a probe dict; array fields come back as numpy arrays."""
+    with open(path) as f:
+        probe = json.load(f)
+    for key in ("mean", "scale", "coef"):
+        probe[key] = np.asarray(probe[key], dtype=np.float64)
+    return probe
 
 
-def score(question, answer, model, tokenizer, device, scaler, clf, layer=16):
-    """
-    Returns hallucination probability in [0, 1] (higher = more likely hallucinated).
-    Shared scorer interface.
-    """
-    h = extract_hidden(question, answer, model, tokenizer, device, layer)
-    h_scaled = scaler.transform(h.reshape(1, -1))
-    return float(clf.predict_proba(h_scaled)[0, 1])
+def _best_layer(results, n_layers):
+    """Highest-AUROC layer; ties break toward mid-network, where the
+    factual-confidence signal concentrates."""
+    best_auc = max(results.values())
+    tied = [layer for layer, auc in results.items() if auc >= best_auc - 1e-9]
+    mid = n_layers / 2
+    return min(tied, key=lambda layer: abs(layer - mid))
 
 
 def sweep_layers(train_records, val_records, model, tokenizer, device, layers=None):
     """
-    Train a probe at each layer and report validation AUROC.
-    Returns dict: {layer: auroc}
+    Train a probe at each candidate layer and report validation AUROC.
+    Returns dict {layer: auroc}.
     """
     from sklearn.metrics import roc_auc_score
 
@@ -120,8 +166,14 @@ def sweep_layers(train_records, val_records, model, tokenizer, device, layers=No
         print(f"  val AUROC: {auc:.4f}")
         results[layer] = auc
 
-    best = max(results, key=results.get)
-    print(f"\nBest layer: {best} (AUROC {results[best]:.4f})")
+    best = _best_layer(results, model.config.num_hidden_layers)
+    spread = max(results.values()) - min(results.values())
+    if spread < 0.02:
+        print(
+            f"\nWARNING: val AUROC varies by only {spread:.4f} across layers; "
+            "the validation set is likely too small for the sweep to mean anything."
+        )
+    print(f"\nBest layer: {best} (val AUROC {results[best]:.4f})")
     return results
 
 
@@ -133,27 +185,39 @@ if __name__ == "__main__":
     parser.add_argument("--layer", type=int, default=16)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--probe", default="probe.pkl")
-    parser.add_argument("--max_n", type=int, default=None)
+    parser.add_argument("--probe", default="probe.json")
+    parser.add_argument("--max_n", type=int, default=None, help="cap training records (debug)")
     args = parser.parse_args()
 
     device = args.device or default_device()
 
-    from data import load_halueval_split
+    from data import load_halueval_splits
 
     if args.sweep or args.train:
         print(f"Loading model {args.model}...")
         model, tokenizer = load_model(args.model, device)
-        train_records, val_records = load_halueval_split(max_n=args.max_n)
+        train_records, val_records, _ = load_halueval_splits()
+        if args.max_n:
+            train_records = train_records[: args.max_n]
+            val_records = val_records[: max(2, args.max_n // 5)]
 
     if args.sweep:
         results = sweep_layers(train_records, val_records, model, tokenizer, device)
-        best_layer = max(results, key=results.get)
-        print(f"\nRun with --train --layer {best_layer} to train the probe at the best layer.")
+        best = _best_layer(results, model.config.num_hidden_layers)
+        print(f"\nRun with --train --layer {best} to train the probe at the best layer.")
 
     elif args.train:
-        scaler, clf = train_probe(train_records, model, tokenizer, device, args.layer)
-        save_probe(scaler, clf, args.layer, args.probe)
+        from sklearn.metrics import roc_auc_score
+
+        probe = train_probe(
+            train_records, model, tokenizer, device, args.layer, meta={"model": args.model}
+        )
+        X_val, y_val = build_features(val_records, model, tokenizer, device, args.layer, verbose=False)
+        try:
+            print(f"Validation AUROC: {roc_auc_score(y_val, predict_proba(X_val, probe)):.4f}")
+        except ValueError:
+            print("Validation AUROC: n/a (degenerate val set)")
+        save_probe(probe, args.probe)
 
     elif args.score:
         question, answer = args.score
@@ -161,8 +225,7 @@ if __name__ == "__main__":
             print(f"Probe {args.probe} not found. Run --train first.")
         else:
             model, tokenizer = load_model(args.model, device)
-            scaler, clf, layer = load_probe(args.probe)
-            s = score(question, answer, model, tokenizer, device, scaler, clf, layer)
-            print(f"Hallucination score: {s:.4f}")
+            probe = load_probe(args.probe)
+            print(f"Hallucination score: {score(question, answer, model, tokenizer, device, probe):.4f}")
     else:
         parser.print_help()

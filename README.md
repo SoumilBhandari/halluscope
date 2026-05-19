@@ -4,6 +4,8 @@ Three ways to catch an LLM lying — and an honest evaluation of which one actua
 
 HalluScope implements and compares three hallucination-detection methods, measures them with AUROC against labeled benchmarks, and ships a Gradio app that highlights fabricated spans in an LLM's answer red→green. It is **not** a new method. It is the missing bridge between 2024–2026 hallucination research and something you can read, run on one GPU, and understand in an afternoon.
 
+[![CI](https://github.com/SoumilBhandari/halluscope/actions/workflows/ci.yml/badge.svg)](https://github.com/SoumilBhandari/halluscope/actions/workflows/ci.yml)
+
 ---
 
 ## Install
@@ -12,7 +14,7 @@ HalluScope implements and compares three hallucination-detection methods, measur
 pip install -r requirements.txt
 ```
 
-No W&B. No Modal. No API keys. One GPU (RTX 3090 / ~24 GB works; tested with `meta-llama/Llama-3.2-3B-Instruct` in bf16).
+No W&B. No Modal. No API keys. No gated models. One GPU (RTX 3090 / ~24 GB works; tested with `Qwen/Qwen2.5-3B-Instruct` in bf16 — Apache-2.0, downloads without a login).
 
 ---
 
@@ -20,36 +22,60 @@ No W&B. No Modal. No API keys. One GPU (RTX 3090 / ~24 GB works; tested with `me
 
 ```bash
 # 1. Train the hidden-state probe on HaluEval
-python probe.py --sweep          # find the best layer (~2 min on 3090)
-python probe.py --train --layer 16
+python probe.py --sweep                 # optional: sweep layers on the val split
+python probe.py --train --layer 20      # writes probe.json
 
-# 2. Run the full AUROC evaluation
-python eval.py --all --dataset halueval
-python eval.py --method probe --dataset truthfulqa   # OOD check
+# 2. Run the AUROC evaluation
+python eval.py --all --dataset halueval   --out results_halueval.json
+python eval.py --all --dataset truthfulqa --out results_truthfulqa.json
 
 # 3. Launch the Gradio demo
 python app.py
 ```
 
-Dev / CPU smoke-test (no GPU required):
+Dev / CPU smoke-test (no GPU, tiny model):
 ```bash
-HALLUSCOPE_MODEL=HuggingFaceTB/SmolLM2-135M python eval.py --method baseline --dataset halueval --max_n 20
+HALLUSCOPE_MODEL=HuggingFaceTB/SmolLM2-135M-Instruct \
+  python eval.py --method baseline --dataset halueval --max_n 200
 ```
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -m "not integration"   # fast unit tests — no model, no GPU, no network
+pytest -m integration         # end-to-end smoke test on a tiny model
+```
+
+CI runs the unit tests on every push and pull request.
 
 ---
 
 ## The scoreboard
 
-Evaluated on `meta-llama/Llama-3.2-3B-Instruct`. HaluEval test split is question-disjoint from the probe training set.
+Evaluated on `Qwen/Qwen2.5-3B-Instruct`. HaluEval is split question-disjoint into train / val / test: the probe trains on train, its layer is chosen on val, and every number below is measured on data the probe never saw.
 
-| Method | Dataset | AUROC | Notes |
+| Method | Dataset | AUROC | N |
 |---|---|---|---|
-| Baseline (log-prob) | HaluEval | — | neg mean token log-prob |
-| Probe (hidden-state) | HaluEval | — | layer 16, last token |
-| Semantic entropy | HaluEval | — | M=10 samples, DeBERTa NLI |
-| Probe (hidden-state) | TruthfulQA | — | trained on HaluEval → OOD drop |
+| Baseline (log-prob) | HaluEval | 0.254 | 4,000 |
+| Probe (hidden-state, layer 20) | HaluEval | **0.988** | 4,000 |
+| Baseline (log-prob) | TruthfulQA | 0.480 | 200 |
+| Probe (hidden-state, layer 20) | TruthfulQA | 0.523 | 200 |
+| Semantic entropy | TruthfulQA | 0.502 | 200 |
 
-*Run `python eval.py --all --dataset halueval` to fill this table with real numbers.*
+Numbers come straight out of `eval.py` (raw output in [`results.json`](results.json)) — measured, not guessed. Reproduce with the two `eval.py` commands above. Semantic entropy is evaluated only on TruthfulQA; on HaluEval `eval.py` reports it as N/A on purpose (see Method 2).
+
+### What the numbers say — the honest read
+
+The honest evaluation is not flattering for two of the three methods:
+
+- **The probe is excellent in-distribution and worthless out of it** — 0.988 on held-out HaluEval, 0.523 (chance) on TruthfulQA. It learned the *style* of HaluEval's hallucinations, not a general "the model is lying" signal. The OOD drop is real, measured, and more severe than the ~0.75 hand-waved in early drafts.
+- **The log-prob baseline is *worse than chance* on HaluEval (0.254)** — anti-correlated with truth. The model is consistently *more* confident on HaluEval's fabricated answers than on the correct ones. Log-probability tracks fluency, and a fabricated answer is fluent, so the baseline doesn't just miss confident hallucinations — it inverts on them.
+- **Semantic entropy did not beat chance here (0.502)** — it does not reproduce Farquhar et al.'s result in this setup. Flagged as a known failure, not hidden; honest candidate reasons are in the caveats below.
+
+The one solid, reproducible result: a linear probe on layer-20 activations separates HaluEval hallucinations near-perfectly — **but only in-distribution.** Take that, and take how easy it is to mistake an in-distribution probe for a working detector.
 
 ---
 
@@ -59,7 +85,7 @@ Evaluated on `meta-llama/Llama-3.2-3B-Instruct`. HaluEval test split is question
 
 **How it works:** tokenize `question + answer`, one forward pass, read the model's own token log-probs. Score = negative mean log-prob over answer tokens. High score = model was surprised by its own output.
 
-**Why it's the weak baseline:** it conflates *lexical* uncertainty with *factual* uncertainty. A model that confidently generates a false answer — the canonical hallucination — scores *low* (looks certain) and slips through. AUROC ~0.65–0.75.
+**Why it's the weak baseline:** it conflates *lexical* uncertainty with *factual* uncertainty. A model that confidently generates a false answer — the canonical hallucination — scores *low* (looks certain) and slips through.
 
 **Code:** [`baseline.py`](baseline.py)
 
@@ -68,15 +94,17 @@ Evaluated on `meta-llama/Llama-3.2-3B-Instruct`. HaluEval test split is question
 ### Method 2 — Semantic entropy (Farquhar et al., *Nature* 2024)
 
 **How it works:**
-1. Sample M=10 answers (temperature 1.0, top-p 0.9).
+1. Sample M=10 answers (temperature 1.0, top-p 0.9), seeded for reproducibility.
 2. Cluster them by bidirectional NLI entailment using `microsoft/deberta-large-mnli`: answers i and j share a cluster iff each entails the other.
 3. Compute entropy over cluster probabilities: `SE = -Σ p(C_k) log p(C_k)`.
 
 High SE = the model generates semantically different answers each time = genuine factual uncertainty.
 
-**Why it's stronger:** measures uncertainty over *meaning*, not *words*. Catches the confidently-wrong answers the baseline misses, because those produce high semantic diversity across samples.
+**The idea:** measure uncertainty over *meaning*, not *words* — in principle catching the confidently-wrong answers the baseline misses, since genuine uncertainty should produce semantically diverse samples. In this repo's run it did not pan out (0.502 — see the scoreboard and caveats): a useful, honest negative result.
 
-**Cost:** 10× model passes per question + O(M²) NLI calls. Worth it on a 3090.
+**Evaluated on TruthfulQA, not HaluEval.** Semantic entropy samples *fresh* answers and measures how much they disagree — it judges the model's uncertainty about a *question*, so the model has to generate the answer itself. HaluEval supplies a pre-written answer the method can't use, so pairing SE with HaluEval would only measure chance. `eval.py` reports `N/A` for that pairing on purpose.
+
+**Cost:** 10× model passes per question + O(M²) NLI calls. Worth it on a 3090. The Gradio app uses M=5 to stay interactive.
 
 **Code:** [`semantic_entropy.py`](semantic_entropy.py)
 
@@ -84,13 +112,13 @@ High SE = the model generates semantically different answers each time = genuine
 
 ### Method 3 — Hidden-state linear probe
 
-**How it works:** train a logistic regression on the model's internal activations (last token, layer ~16) using HaluEval's labeled correct/hallucinated pairs. At inference: one forward pass → extract the activation → classify.
+**How it works:** train a logistic regression on the model's internal activations (last token, layer 20) using HaluEval's labeled correct/hallucinated pairs. At inference: one forward pass → extract the activation → classify.
 
 The model internally encodes factual confidence in directions a linear classifier can find (Azaria & Mitchell 2023, Kossen et al. 2024). The probe reads that signal.
 
-**Expected AUROC ~0.85–0.96 in-distribution.** Single forward pass at inference.
+The trained probe is saved as plain JSON (`probe.json`) — scaler statistics plus the logistic-regression weights — so loading a probe never executes pickled code.
 
-**Honest caveat — the OOD drop:** the probe trained on HaluEval drops to AUROC ~0.7–0.8 on TruthfulQA. It learns the style of HaluEval hallucinations, not universal lying. The eval harness measures and reports this explicitly.
+**Honest caveat — the OOD drop:** the probe trained on HaluEval is strong in-distribution but drops on TruthfulQA. It learns the *style* of HaluEval hallucinations, not universal lying. The eval harness measures and reports this explicitly — see the scoreboard.
 
 **Code:** [`probe.py`](probe.py)
 
@@ -98,11 +126,15 @@ The model internally encodes factual confidence in directions a linear classifie
 
 ## Things we tried / honest caveats
 
-**The confident hallucination blind spot.** The baseline (log-prob) can't catch an answer the model generates fluently and confidently — which is exactly what a well-trained LLM does when hallucinating. AUROC gains from Method 2 and 3 come specifically from closing this gap.
+**The confident-hallucination failure is real — and measurable.** The log-prob baseline can't catch a fluently-generated false answer; on HaluEval it does worse than that and scores *below chance* (0.254). A fabricated-but-fluent answer looks low-perplexity to the model. Only the probe closes this gap, and only in-distribution.
 
-**The OOD probe drop.** Probe AUROC on HaluEval: ~0.91. Same probe on TruthfulQA: ~0.75. The probe learns a dataset-specific representation of "wrong" that doesn't fully transfer. This is not a bug; it's the known limitation of all activation-based detectors and is measured explicitly here.
+**The OOD probe drop is severe.** The probe learns a dataset-specific representation of "wrong" that does not transfer from HaluEval to TruthfulQA — 0.988 down to 0.523 (chance). This is the known limitation of all activation-based detectors, measured explicitly here rather than hidden.
 
-**Semantic entropy is slow.** M=10 samples + N*(N-1)=90 NLI calls per question. On a 3090 with Llama-3B and DeBERTa-large, expect ~45s per question. Set M=5 in the Gradio app to keep it interactive.
+**Semantic entropy underperformed, and we're not hiding it.** SE scored 0.502 on TruthfulQA — chance. It does not reproduce the Farquhar et al. result in this setup. Honest candidate reasons, not excuses: (1) `Qwen2.5-3B-Instruct` is RLHF-aligned and produces low-diversity samples even when wrong, so there is little semantic spread for SE to measure; (2) the ROUGE-1 grading oracle is crude on free-form answers and adds label noise; (3) N=200 is a modest sample. A larger run, a less-aligned model, or a stronger grader might change this — but as run, SE failed, and that is what the table shows.
+
+**Semantic entropy is also slow.** M=10 samples + N*(N-1) NLI calls per question — tens of seconds each; the 200-question TruthfulQA run took ~38 minutes. The Gradio app uses M=5 to stay interactive.
+
+**TruthfulQA labels are noisy.** `grade_truthfulqa` labels an answer by ROUGE-1 overlap against reference answer lists. For free-form instruct-model answers that is crude, and it compresses every method's measurable AUROC toward 0.5. Read the TruthfulQA column as a rough OOD indicator, not a precise number.
 
 **Span alignment is fuzzy.** `highlight.py` uses `difflib.SequenceMatcher` to map atomic claims back to character spans. Claim decomposition by the model is imperfect (sometimes over-splits, sometimes merges claims). The colors are a signal, not a verdict.
 
@@ -112,15 +144,18 @@ The model internally encodes factual confidence in directions a linear classifie
 
 ```
 halluscope/
-├── model.py              load Llama-3.2-3B; generate() returns text + logprobs + hidden states
-├── baseline.py           Method 1 — negative mean log-prob; predictive entropy
+├── model.py              load the LM; chat-templated generate() returns text + logprobs + hidden states
+├── baseline.py           Method 1 — negative mean token log-prob
 ├── semantic_entropy.py   Method 2 — sample → NLI-cluster → entropy (Farquhar et al. 2024)
-├── probe.py              Method 3 — train + apply the hidden-state linear probe
+├── probe.py              Method 3 — train + apply the hidden-state linear probe (saved as JSON)
 ├── data.py               HaluEval + TruthfulQA loaders; ROUGE-1 correctness oracle
 ├── eval.py               AUROC head-to-head — the credibility core
 ├── highlight.py          claim decomposition → per-claim score → red/green HTML spans
 ├── app.py                Gradio web app
-└── requirements.txt
+├── tests/                pytest unit + integration tests
+├── .github/workflows/    CI
+├── requirements.txt      runtime dependencies
+└── requirements-dev.txt  + test tooling
 ```
 
 ---
@@ -143,3 +178,9 @@ halluscope/
 - Obeso & Arditi 2025, *Real-Time Detection of Hallucinated Entities*, arXiv 2509.03531
 - Ji et al. 2023, *HaluEval: A Large-Scale Hallucination Evaluation Benchmark for Large Language Models*
 - Lin et al. 2022, *TruthfulQA: Measuring How Models Mimic Human Falsehoods*, ACL 2022
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

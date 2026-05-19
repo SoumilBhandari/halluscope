@@ -1,0 +1,48 @@
+{
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "generated_at": "2026-05-19 00:36:20",
+  "rows": [
+    {
+      "method": "baseline",
+      "dataset": "halueval",
+      "n": 4000,
+      "auroc": 0.254099625,
+      "notes": "neg mean token log-prob"
+    },
+    {
+      "method": "probe",
+      "dataset": "halueval",
+      "n": 4000,
+      "auroc": 0.9880080000000001,
+      "notes": "layer 20, last token"
+    },
+    {
+      "method": "semantic",
+      "dataset": "halueval",
+      "n": 0,
+      "auroc": null,
+      "notes": "N/A - SE needs generated answers; use truthfulqa"
+    },
+    {
+      "method": "baseline",
+      "dataset": "truthfulqa",
+      "n": 200,
+      "auroc": 0.480054945054945,
+      "notes": "neg mean token log-prob"
+    },
+    {
+      "method": "probe",
+      "dataset": "truthfulqa",
+      "n": 200,
+      "auroc": 0.5226373626373626,
+      "notes": "layer 20, last token"
+    },
+    {
+      "method": "semantic",
+      "dataset": "truthfulqa",
+      "n": 200,
+      "auroc": 0.5017582417582418,
+      "notes": "M=10 samples, DeBERTa NLI"
+    }
+  ]
+}

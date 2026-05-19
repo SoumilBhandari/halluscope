@@ -191,10 +191,19 @@ def main():
     print_table(table_rows)
 
     if args.out:
+        rows = [{**r, "auroc": None if r["auroc"] != r["auroc"] else r["auroc"]} for r in table_rows]
+        # Merge into an existing results file (keyed by method+dataset) so the
+        # scoreboard can be built up across runs -- e.g. one run per dataset.
+        merged = {}
+        if os.path.exists(args.out):
+            with open(args.out) as f:
+                merged = {(r["method"], r["dataset"]): r for r in json.load(f).get("rows", [])}
+        for r in rows:
+            merged[(r["method"], r["dataset"])] = r
         payload = {
             "model": args.model,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "rows": [{**r, "auroc": None if r["auroc"] != r["auroc"] else r["auroc"]} for r in table_rows],
+            "rows": list(merged.values()),
         }
         with open(args.out, "w") as f:
             json.dump(payload, f, indent=2)

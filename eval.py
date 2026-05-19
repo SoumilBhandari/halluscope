@@ -51,19 +51,34 @@ def evaluate_halueval(score_fn, records, model, tokenizer, device, verbose=True)
     return auroc(scores, labels), scores, labels
 
 
-def evaluate_truthfulqa(score_fn, questions, model, tokenizer, device, verbose=True):
-    """Generate an answer per question, grade it, then score it. Returns (auroc, scores, labels)."""
-    scores, labels = [], []
+def generate_truthfulqa_answers(questions, model, tokenizer, device, verbose=True):
+    """
+    Generate a greedy answer per question and grade it. Done once and shared
+    across methods, so `--all` does not regenerate the same answers three times.
+    Returns a list of {"question", "answer", "label"}.
+    """
+    graded = []
     for i, q in enumerate(questions):
         if verbose and i % 10 == 0:
-            print(f"  [{i}/{len(questions)}]", flush=True)
+            print(f"  generating [{i}/{len(questions)}]", flush=True)
         result = generate(
             q["question"], model, tokenizer, device,
             max_new_tokens=100, temperature=0, return_logprobs=False,
         )
-        model_answer = result["text"].strip()
-        labels.append(grade_truthfulqa(model_answer, q["correct_answers"], q["incorrect_answers"]))
-        scores.append(score_fn(q["question"], model_answer, model, tokenizer, device))
+        answer = result["text"].strip()
+        label = grade_truthfulqa(answer, q["correct_answers"], q["incorrect_answers"])
+        graded.append({"question": q["question"], "answer": answer, "label": label})
+    return graded
+
+
+def evaluate_truthfulqa(score_fn, graded, model, tokenizer, device, verbose=True):
+    """Score pre-generated, pre-graded TruthfulQA answers. Returns (auroc, scores, labels)."""
+    scores, labels = [], []
+    for i, g in enumerate(graded):
+        if verbose and i % 10 == 0:
+            print(f"  [{i}/{len(graded)}]", flush=True)
+        scores.append(score_fn(g["question"], g["answer"], model, tokenizer, device))
+        labels.append(g["label"])
     return auroc(scores, labels), scores, labels
 
 
@@ -131,6 +146,8 @@ def main():
             questions = questions[: args.max_n]
         n_examples = len(questions)
         print(f"TruthfulQA: {n_examples} questions")
+        print("Generating model answers (once, shared across methods)...")
+        graded = generate_truthfulqa_answers(questions, model, tokenizer, device)
         test_records = None
 
     table_rows = []
@@ -163,7 +180,7 @@ def main():
         if args.dataset == "halueval":
             auc, _, _ = evaluate_halueval(score_fn, test_records, model, tokenizer, device)
         else:
-            auc, _, _ = evaluate_truthfulqa(score_fn, questions, model, tokenizer, device)
+            auc, _, _ = evaluate_truthfulqa(score_fn, graded, model, tokenizer, device)
         elapsed = time.time() - t0
         print(f"  AUROC: {auc:.4f}  ({elapsed:.0f}s)")
         table_rows.append({

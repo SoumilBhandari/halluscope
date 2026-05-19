@@ -7,14 +7,12 @@ Pipeline:
   3. Map each claim back to its character span in the original answer.
   4. Return a list of annotated spans for rendering.
 
-The visual — red→green colored spans — is the shareable LinkedIn hook.
+The visual — red->green colored spans — is the shareable hook of the demo.
 """
 
 import difflib
 import json
 import re
-
-import torch
 
 from model import DEFAULT_MODEL, default_device, generate, load_model
 
@@ -25,57 +23,55 @@ Answer: {answer}
 Claims:"""
 
 
-def decompose_claims(answer, model, tokenizer, device, max_new_tokens=400):
+def parse_claims(raw, fallback_text):
     """
-    Ask the model to decompose its answer into atomic claims.
-    Returns list of claim strings. Falls back to sentence splitting if JSON parse fails.
+    Extract a JSON array of claim strings from raw model output. Falls back to
+    sentence-splitting `fallback_text` when no valid JSON array is present.
+    Pure function — unit-testable without a model.
     """
-    prompt = DECOMPOSE_PROMPT.format(answer=answer)
-    result = generate(
-        prompt, model, tokenizer, device,
-        max_new_tokens=max_new_tokens,
-        temperature=0,
-        return_logprobs=False,
-        return_hidden_states=False,
-    )
-    raw = result["text"].strip()
-
-    # Try to extract JSON array from the output
     match = re.search(r"\[.*\]", raw, re.DOTALL)
     if match:
         try:
             claims = json.loads(match.group())
             if isinstance(claims, list) and all(isinstance(c, str) for c in claims):
-                return [c.strip() for c in claims if c.strip()]
+                cleaned = [c.strip() for c in claims if c.strip()]
+                if cleaned:
+                    return cleaned
         except json.JSONDecodeError:
             pass
-
-    # Fallback: split on sentence boundaries
-    sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
+    sentences = re.split(r"(?<=[.!?])\s+", fallback_text.strip())
     return [s.strip() for s in sentences if s.strip()]
+
+
+def decompose_claims(answer, model, tokenizer, device, max_new_tokens=400):
+    """Ask the model to decompose its answer into atomic claims."""
+    prompt = DECOMPOSE_PROMPT.format(answer=answer)
+    result = generate(
+        prompt, model, tokenizer, device,
+        max_new_tokens=max_new_tokens, temperature=0,
+        return_logprobs=False, return_hidden_states=False,
+    )
+    return parse_claims(result["text"].strip(), answer)
 
 
 def find_span(claim, answer):
     """
-    Find the best-matching character span of claim in answer using difflib.
-    Returns (start, end) or None if no reasonable match found.
+    Find the best-matching character span of `claim` in `answer`.
+    Returns (start, end), or None if no reasonable match is found.
     """
     claim_lower = claim.lower()
     answer_lower = answer.lower()
 
-    # Try exact substring first
     idx = answer_lower.find(claim_lower)
     if idx != -1:
         return (idx, idx + len(claim))
 
-    # Sliding window fuzzy match: find window with highest similarity
     words = claim.split()
     if not words:
         return None
 
     window = len(claim)
     best_ratio, best_start = 0.0, 0
-
     for start in range(0, max(1, len(answer) - window + 1), max(1, window // 4)):
         end = min(start + window + len(words) * 2, len(answer))
         snippet = answer_lower[start:end]
@@ -85,48 +81,51 @@ def find_span(claim, answer):
 
     if best_ratio < 0.4:
         return None
-
     return (best_start, min(best_start + window, len(answer)))
 
 
+def normalize_scores(scores):
+    """
+    Map raw detector scores into [0, 1] for coloring.
+
+    Scores already within [0, 1] (the probe returns a probability) are used
+    as-is, so a claim's color reflects its absolute hallucination probability.
+    Unbounded scores (the baseline's negative log-prob) are min-max scaled
+    across the claims of this answer — a relative signal, not an absolute one.
+    """
+    if not scores:
+        return []
+    if all(0.0 <= s <= 1.0 for s in scores):
+        return list(scores)
+    lo, hi = min(scores), max(scores)
+    if hi <= lo:
+        return [0.5] * len(scores)
+    return [(s - lo) / (hi - lo) for s in scores]
+
+
 def score_claims(question, claims, score_fn, model, tokenizer, device):
-    """Score each claim independently. Returns list of floats."""
+    """Score each claim independently. Returns a list of floats."""
     return [score_fn(question, claim, model, tokenizer, device) for claim in claims]
 
 
 def highlight(question, answer, score_fn, model, tokenizer, device):
     """
-    Full pipeline: decompose → score → locate spans.
-    Returns list of dicts:
-      {"claim": str, "score": float, "span": (int, int) | None}
-    score is in [0,1] where 1 = definitely hallucinated.
+    Full pipeline: decompose -> score -> locate spans.
+    Returns a list of {"claim": str, "score": float in [0,1], "span": (int,int)|None}.
     """
     claims = decompose_claims(answer, model, tokenizer, device)
-    scores = score_claims(question, claims, score_fn, model, tokenizer, device)
-
-    # Normalize scores to [0,1] range (baseline returns unbounded values)
-    if scores:
-        lo, hi = min(scores), max(scores)
-        if hi > lo:
-            scores = [(s - lo) / (hi - lo) for s in scores]
-        else:
-            scores = [0.5] * len(scores)
-
-    results = []
-    for claim, sc in zip(claims, scores):
-        span = find_span(claim, answer)
-        results.append({"claim": claim, "score": sc, "span": span})
-
-    return results
+    scores = normalize_scores(score_claims(question, claims, score_fn, model, tokenizer, device))
+    return [
+        {"claim": claim, "score": sc, "span": find_span(claim, answer)}
+        for claim, sc in zip(claims, scores)
+    ]
 
 
 def render_html(answer, highlights):
     """
     Build an HTML string with colored spans.
-    score=1 → red (hsl 0), score=0 → green (hsl 120).
-    Overlapping / unmatched claims are appended as footnotes.
+    score=1 -> red (hue 0), score=0 -> green (hue 120).
     """
-    # Build a character-level score map
     scores_map = [None] * len(answer)
     for h in highlights:
         if h["span"] is not None:
@@ -134,7 +133,6 @@ def render_html(answer, highlights):
             for i in range(start, min(end, len(answer))):
                 scores_map[i] = h["score"]
 
-    # Build HTML by grouping consecutive characters with the same score
     parts = []
     i = 0
     while i < len(answer):
@@ -144,7 +142,7 @@ def render_html(answer, highlights):
             j += 1
         chunk = answer[i:j]
         if sc is not None:
-            hue = int((1 - sc) * 120)  # 0→red, 120→green
+            hue = int((1 - sc) * 120)  # 0 -> red, 120 -> green
             lightness = 85 - int(sc * 20)  # slightly darker for high scores
             style = f"background-color: hsl({hue}, 80%, {lightness}%); border-radius: 2px; padding: 1px 2px;"
             parts.append(f'<span style="{style}" title="score: {sc:.2f}">{_esc(chunk)}</span>')
@@ -161,6 +159,7 @@ def _esc(text):
 
 if __name__ == "__main__":
     import argparse
+
     import baseline as baseline_mod
 
     parser = argparse.ArgumentParser()
@@ -179,6 +178,5 @@ if __name__ == "__main__":
         span_str = f"chars {r['span']}" if r["span"] else "no span"
         print(f"  [{r['score']:.3f}] {r['claim']}  ({span_str})")
 
-    html = render_html(args.answer, results)
     print("\nHTML output (open in browser):")
-    print(html)
+    print(render_html(args.answer, results))

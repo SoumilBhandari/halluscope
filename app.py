@@ -1,64 +1,72 @@
 """
 HalluScope Gradio web app.
 
-Type a question → the LLM answers → fabricated spans glow red, confident
+Type a question -> the LLM answers -> fabricated spans glow red, confident
 spans glow green. Choose your detector from the sidebar.
 
 Launch:
     python app.py
 
 Environment:
-    HALLUSCOPE_MODEL   model name (default: meta-llama/Llama-3.2-3B-Instruct)
-    HALLUSCOPE_PROBE   path to probe.pkl (default: probe.pkl)
+    HALLUSCOPE_MODEL     model name (default: Qwen/Qwen2.5-3B-Instruct)
+    HALLUSCOPE_PROBE     path to probe.json (default: probe.json)
+    HALLUSCOPE_RESULTS   path to results.json for the scoreboard (default: results.json)
 """
 
 import functools
+import json
 import os
 
 import gradio as gr
-import torch
 
 import baseline as baseline_mod
 import highlight as hl_mod
 import semantic_entropy as se_mod
 from model import DEFAULT_MODEL, default_device, generate, load_model
 
-PROBE_PATH = os.environ.get("HALLUSCOPE_PROBE", "probe.pkl")
+PROBE_PATH = os.environ.get("HALLUSCOPE_PROBE", "probe.json")
+RESULTS_PATH = os.environ.get("HALLUSCOPE_RESULTS", "results.json")
+
+# Heavy objects load lazily on first request, so importing this module (for
+# tests, or just to inspect it) never downloads or loads a multi-GB model.
+_STATE = {}
 
 
-def _load_all():
+def _ensure_loaded():
+    """Load the language model (and probe, if present) once, on first use."""
+    if "model" in _STATE:
+        return
+    print("Loading model - this may take a moment...")
     device = default_device()
     model, tokenizer = load_model(DEFAULT_MODEL, device)
-
-    nli_model, nli_tokenizer = None, None
-    probe_score_fn = None
-
+    _STATE.update(
+        model=model, tokenizer=tokenizer, device=device,
+        nli_model=None, nli_tokenizer=None, probe=None,
+    )
     if os.path.exists(PROBE_PATH):
         import probe as probe_mod
-        scaler, clf, layer = probe_mod.load_probe(PROBE_PATH)
-        probe_score_fn = functools.partial(probe_mod.score, scaler=scaler, clf=clf, layer=layer)
-
-    return model, tokenizer, device, nli_model, nli_tokenizer, probe_score_fn
-
-
-print("Loading model — this may take a moment...")
-_model, _tokenizer, _device, _nli_model, _nli_tokenizer, _probe_score_fn = _load_all()
+        _STATE["probe"] = probe_mod.load_probe(PROBE_PATH)
 
 
 def _get_score_fn(method):
     if method == "Baseline (log-prob)":
         return baseline_mod.score
-    elif method == "Probe (hidden-state)":
-        if _probe_score_fn is None:
+
+    if method == "Probe (hidden-state)":
+        if _STATE.get("probe") is None:
             return None
-        return _probe_score_fn
-    elif method == "Semantic Entropy":
-        # Lazy-load NLI model on first use
-        global _nli_model, _nli_tokenizer
-        if _nli_model is None:
+        import probe as probe_mod
+        return functools.partial(probe_mod.score, probe=_STATE["probe"])
+
+    if method == "Semantic Entropy":
+        if _STATE.get("nli_model") is None:
             print("Loading NLI model...")
-            _nli_model, _nli_tokenizer = se_mod.load_nli_model(_device)
-        return functools.partial(se_mod.score, nli_model=_nli_model, nli_tokenizer=_nli_tokenizer, M=5)
+            nli_model, nli_tokenizer = se_mod.load_nli_model(_STATE["device"])
+            _STATE.update(nli_model=nli_model, nli_tokenizer=nli_tokenizer)
+        return functools.partial(
+            se_mod.score, nli_model=_STATE["nli_model"],
+            nli_tokenizer=_STATE["nli_tokenizer"], M=5,
+        )
     return None
 
 
@@ -66,6 +74,7 @@ def run(question, method, max_new_tokens):
     if not question.strip():
         return "<p><em>Please enter a question.</em></p>", ""
 
+    _ensure_loaded()
     score_fn = _get_score_fn(method)
     if score_fn is None:
         return (
@@ -73,9 +82,8 @@ def run(question, method, max_new_tokens):
             "",
         )
 
-    # Generate a greedy answer
     result = generate(
-        question, _model, _tokenizer, _device,
+        question, _STATE["model"], _STATE["tokenizer"], _STATE["device"],
         max_new_tokens=int(max_new_tokens),
         temperature=0,
         return_logprobs=False,
@@ -83,14 +91,15 @@ def run(question, method, max_new_tokens):
     )
     answer = result["text"].strip()
 
-    # Highlight claims
-    highlights = hl_mod.highlight(question, answer, score_fn, _model, _tokenizer, _device)
+    highlights = hl_mod.highlight(
+        question, answer, score_fn,
+        _STATE["model"], _STATE["tokenizer"], _STATE["device"],
+    )
     html = hl_mod.render_html(answer, highlights)
 
-    # Build claim table
     rows = ""
     for h in highlights:
-        color = f"hsl({int((1-h['score'])*120)}, 70%, 40%)"
+        color = f"hsl({int((1 - h['score']) * 120)}, 70%, 40%)"
         rows += (
             f"<tr>"
             f"<td style='padding:4px 8px; color:{color}; font-weight:bold'>{h['score']:.2f}</td>"
@@ -102,18 +111,35 @@ def run(question, method, max_new_tokens):
     return html, table_html
 
 
-DESCRIPTION = """
+def _scoreboard_md():
+    """Render the measured scoreboard from results.json, or a placeholder."""
+    if not os.path.exists(RESULTS_PATH):
+        return (
+            "_No measured results yet. Run "
+            "`python eval.py --all --dataset truthfulqa --out results.json`._"
+        )
+    with open(RESULTS_PATH) as f:
+        data = json.load(f)
+    lines = ["| Method | Dataset | AUROC | N |", "|---|---|---|---|"]
+    for r in data.get("rows", []):
+        auc = "N/A" if r.get("auroc") is None else f"{r['auroc']:.3f}"
+        lines.append(f"| {r['method']} | {r['dataset']} | {auc} | {r.get('n', '')} |")
+    return f"Measured on `{data.get('model', '?')}`:\n\n" + "\n".join(lines)
+
+
+DESCRIPTION = f"""
 ## HalluScope — three ways to catch an LLM lying
 
-Type a question. The model answers. Fabricated spans glow **red**; confident spans glow **green**.
+Type a question. The model answers. Fabricated spans glow **red**; confident
+spans glow **green**. Pick a detector on the left.
 
-| Method | How it works | AUROC |
-|---|---|---|
-| Baseline (log-prob) | Negative mean token log-prob | ~0.70 |
-| Probe (hidden-state) | Linear classifier on layer activations | ~0.91 |
-| Semantic Entropy | NLI-clustered answer diversity | ~0.83 |
+- **Baseline (log-prob)** — negative mean token log-probability.
+- **Probe (hidden-state)** — a linear classifier on the model's layer activations.
+- **Semantic Entropy** — NLI-clustered diversity across resampled answers.
 
-*Scores are in-distribution (HaluEval). Probe drops to ~0.75 on TruthfulQA (OOD — documented in README).*
+{_scoreboard_md()}
+
+*Scores are continuous estimates, not verdicts — never threshold and ship.*
 """
 
 with gr.Blocks(title="HalluScope") as demo:
@@ -158,4 +184,5 @@ with gr.Blocks(title="HalluScope") as demo:
 
 
 if __name__ == "__main__":
+    _ensure_loaded()
     demo.launch()

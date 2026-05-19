@@ -1,6 +1,11 @@
-torch>=2.2
-transformers>=4.40
-datasets>=2.19
-scikit-learn>=1.4
-gradio>=4.36
+# Core dependencies. Lower bounds reflect the oldest APIs HalluScope uses;
+# upper bounds guard against breaking changes in the next major release.
+# Tested with torch 2.6, transformers 5.8, datasets 4.8, scikit-learn 1.8,
+# numpy 2.4, gradio 6.14.
+torch>=2.2,<3
+transformers>=5.0,<6
+datasets>=2.19,<5
+scikit-learn>=1.4,<2
+numpy>=1.24,<3
+gradio>=4.36,<7
 rouge-score>=0.1.2

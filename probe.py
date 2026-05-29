@@ -45,16 +45,17 @@ def extract_hidden(question, answer, model, tokenizer, device, layer=16):
     return outputs.hidden_states[layer][0, -1, :].cpu().float().numpy()
 
 
-def build_features(records, model, tokenizer, device, layer=16, batch_size=16, verbose=True):
+def build_layer_features(records, model, tokenizer, device, layers, batch_size=16, verbose=True):
     """
-    Batched hidden-state extraction for a list of records.
-    Returns (X, y): X is (N, D) float32, y is (N,) int.
+    Batched extraction of last-token hidden states at several layers, with a
+    single forward pass per batch. Returns ({layer: (N, D) float32}, y).
 
-    Batching makes feature extraction roughly an order of magnitude faster than
-    one forward pass per record. The last *non-pad* token is selected per
-    sequence, so the result is independent of the tokenizer's padding side.
+    The layer sweep uses this so it costs one forward pass per example, not one
+    per candidate layer. The last *non-pad* token is selected per sequence, so
+    the result is independent of the tokenizer's padding side.
     """
-    feats, labels = [], []
+    feats = {layer: [] for layer in layers}
+    labels = []
     for start in range(0, len(records), batch_size):
         if verbose and start % (batch_size * 8) == 0:
             print(f"  extracting [{start}/{len(records)}]", flush=True)
@@ -65,13 +66,19 @@ def build_features(records, model, tokenizer, device, layer=16, batch_size=16, v
         ).to(device)
         with torch.no_grad():
             out = model(**enc, output_hidden_states=True)
-        hs = out.hidden_states[layer]  # (B, T, D)
         mask = enc["attention_mask"]
         last_idx = mask.shape[1] - 1 - mask.flip(1).long().argmax(dim=1)  # last real token
-        rows = torch.arange(hs.shape[0], device=hs.device)
-        feats.append(hs[rows, last_idx].cpu().float())
+        rows = torch.arange(mask.shape[0], device=mask.device)
+        for layer in layers:
+            feats[layer].append(out.hidden_states[layer][rows, last_idx].cpu().float())
         labels.extend(r["label"] for r in batch)
-    return torch.cat(feats).numpy(), np.array(labels)
+    return {layer: torch.cat(v).numpy() for layer, v in feats.items()}, np.array(labels)
+
+
+def build_features(records, model, tokenizer, device, layer=16, batch_size=16, verbose=True):
+    """Last-token hidden states at a single layer. Returns (X, y)."""
+    feats, y = build_layer_features(records, model, tokenizer, device, [layer], batch_size, verbose)
+    return feats[layer], y
 
 
 def train_probe(records, model, tokenizer, device, layer=16, meta=None):
@@ -143,30 +150,33 @@ def _best_layer(results, n_layers):
 
 def sweep_layers(train_records, val_records, model, tokenizer, device, layers=None):
     """
-    Train a probe at each candidate layer and report validation AUROC.
+    Train a probe at each candidate layer and report validation AUROC. Features
+    for all candidate layers are extracted in a single pass over the data, so
+    the sweep costs one forward pass per example, not one per layer.
     Returns dict {layer: auroc}.
     """
     from sklearn.metrics import roc_auc_score
 
+    n_layers = model.config.num_hidden_layers
     if layers is None:
-        n_layers = model.config.num_hidden_layers
         step = max(1, n_layers // 8)
         layers = list(range(step, n_layers, step))
 
+    print(f"Extracting features at layers {layers} (train: {len(train_records)} records)...")
+    X_train, y_train = build_layer_features(train_records, model, tokenizer, device, layers)
+    print(f"Extracting features at layers {layers} (val: {len(val_records)} records)...")
+    X_val, y_val = build_layer_features(val_records, model, tokenizer, device, layers)
+
     results = {}
     for layer in layers:
-        print(f"\nLayer {layer}:")
-        X_train, y_train = build_features(train_records, model, tokenizer, device, layer, verbose=False)
-        X_val, y_val = build_features(val_records, model, tokenizer, device, layer, verbose=False)
         scaler = StandardScaler()
         clf = LogisticRegression(max_iter=500, C=1.0, solver="lbfgs")
-        clf.fit(scaler.fit_transform(X_train), y_train)
-        val_probs = clf.predict_proba(scaler.transform(X_val))[:, 1]
-        auc = roc_auc_score(y_val, val_probs)
-        print(f"  val AUROC: {auc:.4f}")
+        clf.fit(scaler.fit_transform(X_train[layer]), y_train)
+        auc = roc_auc_score(y_val, clf.predict_proba(scaler.transform(X_val[layer]))[:, 1])
+        print(f"  layer {layer}: val AUROC {auc:.4f}")
         results[layer] = auc
 
-    best = _best_layer(results, model.config.num_hidden_layers)
+    best = _best_layer(results, n_layers)
     spread = max(results.values()) - min(results.values())
     if spread < 0.02:
         print(
@@ -177,12 +187,40 @@ def sweep_layers(train_records, val_records, model, tokenizer, device, layers=No
     return results
 
 
+def _load_train_val(dataset, seed=42):
+    """
+    (train_records, val_records) for the chosen training dataset.
+
+    For cross-dataset experiments: train on one dataset, then evaluate on the
+    other with eval.py to measure OOD transfer. truthfulqa_mc gets a simple
+    random train/val split, which is fine because the real test set is a
+    *different* dataset.
+    """
+    if dataset == "halueval":
+        from data import load_halueval_splits
+
+        train, val, _ = load_halueval_splits()
+        return train, val
+    if dataset == "truthfulqa_mc":
+        import random
+
+        from data import load_truthfulqa_mc
+
+        records = load_truthfulqa_mc()
+        random.Random(seed).shuffle(records)
+        n_val = max(1, len(records) // 6)
+        return records[n_val:], records[:n_val]
+    raise ValueError(f"unknown train dataset: {dataset}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--sweep", action="store_true")
     parser.add_argument("--score", nargs=2, metavar=("QUESTION", "ANSWER"))
     parser.add_argument("--layer", type=int, default=16)
+    parser.add_argument("--train_dataset", choices=["halueval", "truthfulqa_mc"], default="halueval",
+                        help="dataset to train/sweep the probe on (evaluate on the other for OOD)")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--device", default=None)
     parser.add_argument("--probe", default="probe.json")
@@ -191,12 +229,10 @@ if __name__ == "__main__":
 
     device = args.device or default_device()
 
-    from data import load_halueval_splits
-
     if args.sweep or args.train:
         print(f"Loading model {args.model}...")
         model, tokenizer = load_model(args.model, device)
-        train_records, val_records, _ = load_halueval_splits()
+        train_records, val_records = _load_train_val(args.train_dataset)
         if args.max_n:
             train_records = train_records[: args.max_n]
             val_records = val_records[: max(2, args.max_n // 5)]
@@ -210,7 +246,8 @@ if __name__ == "__main__":
         from sklearn.metrics import roc_auc_score
 
         probe = train_probe(
-            train_records, model, tokenizer, device, args.layer, meta={"model": args.model}
+            train_records, model, tokenizer, device, args.layer,
+            meta={"model": args.model, "train_dataset": args.train_dataset},
         )
         X_val, y_val = build_features(val_records, model, tokenizer, device, args.layer, verbose=False)
         try:

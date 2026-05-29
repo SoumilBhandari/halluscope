@@ -53,6 +53,32 @@ CI runs the unit tests on every push and pull request.
 
 ---
 
+## Deploy the demo (Hugging Face Spaces)
+
+The Gradio app is Spaces-ready. With a free Hugging Face account, from the repo root:
+
+```bash
+pip install -U gradio
+gradio deploy            # prompts for an HF token, creates the Space
+```
+
+That ships `app.py` with the committed `probe.json`, so the baseline and probe
+work immediately (semantic entropy downloads its NLI model on first use). Give
+the Space a GPU for the 3B model to feel responsive; on CPU, point
+`HALLUSCOPE_MODEL` at a smaller model. To wire it up by hand instead, create a
+Gradio Space (app file `app.py`) and add this header to the Space's `README.md`:
+
+```yaml
+---
+title: HalluScope
+emoji: 🔬
+sdk: gradio
+app_file: app.py
+---
+```
+
+---
+
 ## The scoreboard
 
 Evaluated on `Qwen/Qwen2.5-3B-Instruct`. HaluEval is split question-disjoint into train / val / test: the probe trains on train, its layer is chosen on val, and every number below is measured on data the probe never saw.

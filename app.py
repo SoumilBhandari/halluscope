@@ -184,5 +184,7 @@ with gr.Blocks(title="HalluScope") as demo:
 
 
 if __name__ == "__main__":
-    _ensure_loaded()
-    demo.launch()
+    # Load lazily on the first request (not at startup) so the app boots fast
+    # and stays within Hugging Face Spaces' startup timeout; queue() handles
+    # concurrent users.
+    demo.queue().launch()

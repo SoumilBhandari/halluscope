@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import math
+from collections import Counter
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -103,7 +104,7 @@ def cluster_entropy(cluster_ids):
 
 
 @torch.no_grad()
-def sample_answers(question, model, tokenizer, device, M=10, seed=0):
+def sample_answers(question, model, tokenizer, device, M=10, temperature=1.0, seed=0):
     """Sample M diverse answers from the model. Seeded for reproducibility."""
     from model import generate
 
@@ -111,7 +112,7 @@ def sample_answers(question, model, tokenizer, device, M=10, seed=0):
         torch.manual_seed(seed)
     results = generate(
         question, model, tokenizer, device,
-        max_new_tokens=150, temperature=1.0, top_p=0.9, top_k=50,
+        max_new_tokens=150, temperature=temperature, top_p=0.9, top_k=50,
         num_return_sequences=M, return_logprobs=False, return_hidden_states=False,
     )
     if isinstance(results, dict):
@@ -119,42 +120,88 @@ def sample_answers(question, model, tokenizer, device, M=10, seed=0):
     return [r["text"] for r in results]
 
 
-def score(question, answer, model, tokenizer, device, nli_model=None, nli_tokenizer=None, M=10, seed=0):
+def score(question, answer, model, tokenizer, device, nli_model=None, nli_tokenizer=None,
+          M=10, temperature=1.0, seed=0):
     """
     Hallucination score via semantic entropy. `answer` is ignored: the method
     samples fresh answers from the model to measure its uncertainty. The
     parameter is kept for interface compatibility with eval.py's scorers.
 
     Higher SE = more semantic disagreement across samples = more uncertain.
+    Raising `temperature` increases sample diversity, which matters for
+    heavily-aligned models that otherwise answer near-identically every time.
     """
     if nli_model is None or nli_tokenizer is None:
         raise ValueError("Pass nli_model and nli_tokenizer (loaded once, reused across calls).")
 
-    answers = sample_answers(question, model, tokenizer, device, M=M, seed=seed)
+    answers = sample_answers(question, model, tokenizer, device, M=M, temperature=temperature, seed=seed)
     cluster_ids = cluster_answers(answers, question, nli_model, nli_tokenizer, device)
     return cluster_entropy(cluster_ids)
 
 
+def diagnose(questions, model, tokenizer, device, nli_model, nli_tokenizer,
+             M=10, temperature=1.0, seed=0):
+    """
+    Run SE over a list of questions and summarize sample diversity. If the
+    model collapses most questions to 1-2 clusters, semantic entropy has almost
+    nothing to measure — the likely cause of a chance-level AUROC.
+    Returns (cluster_count_histogram, list_of_SE_values).
+    """
+    counts, ses = Counter(), []
+    for i, q in enumerate(questions):
+        answers = sample_answers(q, model, tokenizer, device, M=M, temperature=temperature, seed=seed)
+        cluster_ids = cluster_answers(answers, q, nli_model, nli_tokenizer, device)
+        k = len(set(cluster_ids))
+        counts[k] += 1
+        ses.append(cluster_entropy(cluster_ids))
+        print(f"  [{i + 1}/{len(questions)}] clusters={k}/{M}  SE={ses[-1]:.3f}", flush=True)
+
+    total = sum(counts.values())
+    mean_clusters = sum(k * n for k, n in counts.items()) / total
+    print(f"\nCluster-count distribution (clusters: #questions): {dict(sorted(counts.items()))}")
+    print(f"Mean unique clusters: {mean_clusters:.2f} / {M}")
+    print(f"Mean SE: {sum(ses) / len(ses):.3f}  (max possible {math.log(M):.3f})")
+    return counts, ses
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--question", required=True)
+    parser.add_argument("--question", default=None, help="score a single question")
+    parser.add_argument("--diagnose", type=int, default=0, metavar="N",
+                        help="run SE over N TruthfulQA questions and report sample diversity")
     parser.add_argument("--M", type=int, default=10)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
     device = args.device or default_device()
+
+    if not args.question and not args.diagnose:
+        parser.print_help()
+        raise SystemExit("\nPass --question \"...\" or --diagnose N.")
+
     print(f"Loading LLM ({args.model})...")
     model, tokenizer = load_model(args.model, device)
     print(f"Loading NLI model ({NLI_MODEL_NAME})...")
     nli_model, nli_tokenizer = load_nli_model(device)
 
-    answers = sample_answers(args.question, model, tokenizer, device, M=args.M)
-    print(f"\nSampled {len(answers)} answers:")
-    for i, a in enumerate(answers):
-        print(f"  [{i}] {a[:120]}")
+    if args.diagnose:
+        from data import load_truthfulqa
 
-    cluster_ids = cluster_answers(answers, args.question, nli_model, nli_tokenizer, device)
-    print(f"\nCluster assignments: {cluster_ids}")
-    print(f"Unique clusters: {len(set(cluster_ids))} / {len(answers)}")
-    print(f"Semantic entropy: {cluster_entropy(cluster_ids):.4f}")
+        questions = [r["question"] for r in load_truthfulqa()[: args.diagnose]]
+        print(f"\nDiagnosing sample diversity over {len(questions)} questions "
+              f"(M={args.M}, temperature={args.temperature})...")
+        diagnose(questions, model, tokenizer, device, nli_model, nli_tokenizer,
+                 M=args.M, temperature=args.temperature)
+    else:
+        answers = sample_answers(args.question, model, tokenizer, device,
+                                 M=args.M, temperature=args.temperature)
+        print(f"\nSampled {len(answers)} answers:")
+        for i, a in enumerate(answers):
+            print(f"  [{i}] {a[:120]}")
+
+        cluster_ids = cluster_answers(answers, args.question, nli_model, nli_tokenizer, device)
+        print(f"\nCluster assignments: {cluster_ids}")
+        print(f"Unique clusters: {len(set(cluster_ids))} / {len(answers)}")
+        print(f"Semantic entropy: {cluster_entropy(cluster_ids):.4f}")

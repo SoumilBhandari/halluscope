@@ -1,0 +1,7 @@
+line-length = 120
+target-version = "py312"
+
+[lint]
+# pyflakes (F), pycodestyle errors+warnings (E, W), import sorting (I),
+# pyupgrade (UP), and a few bugbear checks (B).
+select = ["E", "F", "I", "W", "UP", "B"]

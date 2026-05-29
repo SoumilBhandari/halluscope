@@ -1,4 +1,5 @@
-# Development dependencies: everything in requirements.txt plus test tooling.
+# Development dependencies: everything in requirements.txt plus test + lint tooling.
 #   pip install -r requirements-dev.txt
 -r requirements.txt
 pytest>=8.0,<9
+ruff>=0.5

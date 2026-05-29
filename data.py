@@ -91,7 +91,7 @@ def load_truthfulqa_mc():
     records = []
     for row in ds[split]:
         mc1 = row["mc1_targets"]
-        for choice, correct in zip(mc1["choices"], mc1["labels"]):
+        for choice, correct in zip(mc1["choices"], mc1["labels"], strict=True):
             records.append(
                 {"question": row["question"], "answer": choice, "label": 0 if correct == 1 else 1}
             )

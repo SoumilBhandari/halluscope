@@ -16,11 +16,11 @@ import re
 
 from model import DEFAULT_MODEL, default_device, generate, load_model
 
-DECOMPOSE_PROMPT = """Break the following answer into a JSON array of short, atomic factual claims. Each claim should be one sentence or less. Output only valid JSON.
-
-Answer: {answer}
-
-Claims:"""
+DECOMPOSE_PROMPT = (
+    "Break the following answer into a JSON array of short, atomic factual claims. "
+    "Each claim should be one sentence or less. Output only valid JSON.\n\n"
+    "Answer: {answer}\n\nClaims:"
+)
 
 
 def parse_claims(raw, fallback_text):
@@ -117,7 +117,7 @@ def highlight(question, answer, score_fn, model, tokenizer, device):
     scores = normalize_scores(score_claims(question, claims, score_fn, model, tokenizer, device))
     return [
         {"claim": claim, "score": sc, "span": find_span(claim, answer)}
-        for claim, sc in zip(claims, scores)
+        for claim, sc in zip(claims, scores, strict=True)
     ]
 
 

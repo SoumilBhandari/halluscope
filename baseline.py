@@ -10,7 +10,6 @@ low (looks "certain") and evades this detector. AUROC ~0.65–0.75 on HaluEval.
 """
 
 import argparse
-import os
 
 import torch
 import torch.nn.functional as F

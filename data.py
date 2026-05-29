@@ -78,6 +78,26 @@ def load_truthfulqa():
     return records
 
 
+def load_truthfulqa_mc():
+    """
+    TruthfulQA multiple-choice (mc1) as fixed (question, answer, label) records
+    with clean ground-truth labels — no ROUGE/generation grading, so the labels
+    carry no oracle noise. label 0 = a correct choice, 1 = an incorrect
+    (hallucinated) choice. Each question contributes one correct + several
+    incorrect choices.
+    """
+    ds = load_dataset("truthful_qa", "multiple_choice")
+    split = "validation" if "validation" in ds else list(ds.keys())[0]
+    records = []
+    for row in ds[split]:
+        mc1 = row["mc1_targets"]
+        for choice, correct in zip(mc1["choices"], mc1["labels"]):
+            records.append(
+                {"question": row["question"], "answer": choice, "label": 0 if correct == 1 else 1}
+            )
+    return records
+
+
 _scorer = None
 
 
